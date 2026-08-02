@@ -2,8 +2,11 @@
 import fritz
 
 # Fritz looks for handlers in $PATH
+from pathlib import Path
 from os import environ, pathsep
 environ["PATH"] += pathsep + "./arsenal/"
+run_script_path = Path(__file__).resolve().parent
+environ["PATH"] += pathsep + str(run_script_path / "arsenal")
 
 # Push handler processes, referred to as "arm"s.
 # Fritz manages the life time of these processes.
