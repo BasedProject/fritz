@@ -56,7 +56,11 @@ class Fritz_arm:
 		if self.pid == 0:
 			execvp(self.name, f"{name}".split(' '))
 		else:
-			self.wait_for_socket(self.sock_path)
+			if not self.wait_for_socket(self.sock_path):
+				raise RuntimeError(
+					f"Fritz_arm({self.name!r}): socket {self.sock_path!r} "
+					f"was not created within timeout (child pid {self.pid})"
+				)
 			self.client = FastCGIClient(f"unix://{self.sock_path}")
 	def request(self, params={}, stdin=b''):
 		return self.client.request(params, stdin)
