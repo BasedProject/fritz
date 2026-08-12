@@ -155,8 +155,9 @@ class Fritz(SimpleIRCClient):
 	# === === ===
 
 	def insert_global_data(self, data : {str : str}, event_name : str) -> {str : str}:
-		data["JOINED"] = ":".join(self.joined)
-		data["EVENT"]  = event_name
+		data["BOTNAME"] = self.nick
+		data["JOINED"]  = ":".join(self.joined)
+		data["EVENT"]   = event_name
 		return data
 
 	def handle_response(self, response : str | None):

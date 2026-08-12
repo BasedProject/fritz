@@ -40,6 +40,7 @@ To see what is implemented, consult the top of the source.
 The special (non-IRC) event `poll` is provided which will be invoked periodically.
 
 The following environment variables could be defined depending on the event:
+* BOTNAME (name of the Fritz instance on the server)
 * USERNAME (name of the triggering user)
 * CHANNEL (source chan)
 * JOINED (list of currently joined chans)
