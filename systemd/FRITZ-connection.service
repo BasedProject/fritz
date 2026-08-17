@@ -1,0 +1,23 @@
+[Unit]
+Description=irc-link: persistent IRC network connection for Fritz
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust server/port/socket path to taste. --no-tls if plaintext.
+ExecStart=/var/www/fritz/venv/bin/python3 /var/www/fritz/fritz-connection.py \
+	--server chud.cyou \
+	--port 6697 \
+	--control-socket /run/fritz/FRITZ.sock
+Restart=always
+RestartSec=5
+RuntimeDirectory=fritz
+RuntimeDirectoryMode=0770
+
+StandardError=journal
+
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

@@ -1,4 +1,4 @@
-import ssl
+import socket
 import heapq
 import atexit
 import signal
@@ -8,7 +8,23 @@ from os import fork, execvp, path, unlink, setpgid, kill
 from time import time, sleep, monotonic
 from fcgi_client import FastCGIClient
 from irc.client import SimpleIRCClient, ServerConnectionError
-from irc.connection import Factory
+
+# --- ----------------------------- ---
+# --- irc-link connect_factory      ---
+# --- ----------------------------- ---
+# The real TCP/TLS session to the network is owned by the persistent
+# irc-link daemon (see irc-link.py), not by this process. Fritz dials
+# a local Unix domain socket instead of the actual server; irc-link
+# relays to/from the real connection on the other end and survives
+# this process being killed and restarted. See irc-link.py's module
+# docstring for the reattach protocol (registration replay, etc).
+class LinkFactory:
+	def __init__(self, path):
+		self.path = path
+	def __call__(self, server_address):
+		sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		sock.connect(self.path)
+		return sock
 
 # --- ------- ---
 # --- Private ---
@@ -23,6 +39,8 @@ event_queues = {
 	'priv_msg' : [],
 	'chan_msg' : [],
 }
+
+IRC_DEFAULT_LINE_LEN = 512  # RFC 1459/2812 default, includes trailing CRLF
 
 # Poll scheduling
 @dataclass(order=True)
@@ -107,10 +125,14 @@ def add_arm(name, events=[], poll_interval=None):
 		add_polling(poll_interval, arm)
 
 class Fritz(SimpleIRCClient):
-	def __init__(self, server, nick, auto_join_list, port=6697, is_ssl=True):
-		def ssl_wrapper(sock):
-			context = ssl.create_default_context()
-			return context.wrap_socket(sock, server_hostname=server)
+	def __init__(self, server, nick, auto_join_list, port=6697,
+	             link_socket_path='/run/fritz/fritz.sock'):
+		# server/port are no longer dialed directly -- they're passed
+		# through to irc.client.ServerConnection.connect() for its own
+		# bookkeeping/logging (server_address, etc) but the actual
+		# socket comes from LinkFactory, which connects to irc-link
+		# instead. TLS and the real network address live entirely in
+		# irc-link's configuration now, not here.
 
 		atexit.register(my_atexit)
 
@@ -118,12 +140,22 @@ class Fritz(SimpleIRCClient):
 		self.auto_join_list = auto_join_list
 		self.joined			= []
 
-		if port < 6690:
-			is_ssl = False
-
-		factory = Factory(wrapper=ssl_wrapper) if is_ssl else Factory()
+		factory = LinkFactory(link_socket_path)
 
 		super().__init__()
+
+		# Filled in once ISUPPORT (numeric 005) has been parsed; until
+		# then, assume the IRC default. jaraco/irc's ServerConnection
+		# still hard-caps sends at 512 bytes regardless of what LINELEN
+		# says (see _prep_message), so clamp to that ceiling rather than
+		# trusting an ergo server configured with a larger max-line-len.
+		# If you actually need longer lines, override _prep_message on
+		# self.connection instead of clamping here.
+		self.max_line_len = IRC_DEFAULT_LINE_LEN
+		self.connection.add_global_handler(
+			'featurelist', self._on_featurelist, -10
+		)
+
 		try:
 			super().connect(
 				server,
@@ -137,6 +169,12 @@ class Fritz(SimpleIRCClient):
 
 		self.run()
 
+	def _on_featurelist(self, connection, event):
+		self.max_line_len = min(
+			getattr(connection.features, 'linelen', IRC_DEFAULT_LINE_LEN),
+			IRC_DEFAULT_LINE_LEN,
+		)
+
 	# === Privmsg humilation ritual ===
 	# The library provided privmsg() is a foot gun:
 	#  * for messages which are too long for the IRC protocol,
@@ -147,8 +185,7 @@ class Fritz(SimpleIRCClient):
 	#     it fails silently
 	#     (bug report pending) # XXX insert link
 	def privmsg(self, target : str, message : str):
-		safe_magick_lenght = 160
-		n_free_bytes = safe_magick_lenght - len('PRIVMSG  :\r\n') - len(target.encode('utf-8'))
+		n_free_bytes = self.max_line_len - len('PRIVMSG  :\r\n') - len(target.encode('utf-8'))
 		raw_message = message.encode('utf-8')
 		for m in [raw_message[i:i+n_free_bytes] for i in range(0, len(raw_message), n_free_bytes)]:
 			self.connection.privmsg(target, m.decode('utf-8', errors='ignore'))

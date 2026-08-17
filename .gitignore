@@ -4,4 +4,10 @@ arsenal/hibot/hibot
 .cmdtest-filter
 tmp-cmdtest*
 .gdb_history
+venv
+rdap
+auth.list
 history.txt
+news.feeds
+tell.store
+alarm.store

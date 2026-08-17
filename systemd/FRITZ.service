@@ -1,0 +1,22 @@
+[Unit]
+Description=FRITZ: IRC bot control process (arms, dispatch)
+After=FRITZ-connection.service
+Requires=FRITZ-connection.service
+# NOT PartOf=irc-link.service: control restarting must never restart
+# or stop irc-link. Requires= only enforces irc-link exists before
+# this starts, it doesn't couple their lifecycles the other way.
+
+[Service]
+Type=simple
+WorkingDirectory=/var/www/fritz
+ExecStart=/var/www/fritz/venv/bin/python3 /var/www/fritz/bot_FRITZ.py
+
+Restart=on-failure
+RestartSec=5
+
+StandardError=journal
+
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
