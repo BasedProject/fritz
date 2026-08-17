@@ -10,10 +10,10 @@ environ["PATH"] += pathsep + "./arsenal/sneeds_feeder/"
 fritz.add_arm("AM.pl", ['chan_msg'])
 
 fritz.Fritz(
-	"chud.cyou",	# server address
-	"AM",		# bot username
-	["#chud"],		# channels to join
-	# ["#fritz"],		# channels to join
+	"chud.cyou",
+	"AM",
+        # note that support for many channels may be errorsome with some of the arsenal, I suspect.
+	["#chud"],
 	port=6697,
         link_socket_path='/run/fritz/AM.sock'
 )
