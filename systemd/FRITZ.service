@@ -10,6 +10,8 @@ Requires=FRITZ-connection.service
 Type=simple
 WorkingDirectory=/var/www/fritz
 ExecStart=/var/www/fritz/venv/bin/python3 /var/www/fritz/bot_FRITZ.py
+User=fritz
+Group=fritz
 
 Restart=on-failure
 RestartSec=5

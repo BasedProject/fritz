@@ -14,6 +14,8 @@ Restart=always
 RestartSec=5
 RuntimeDirectory=fritz
 RuntimeDirectoryMode=0770
+User=fritz
+Group=fritz
 
 StandardError=journal
 
