@@ -15,8 +15,8 @@ my @pastas = (
 );
 
 # ---------- Configuration ----------
-my $activation_phrase = "hate";
-my $keyword_chance    = 1/5;
+my $activation_phrase = "(?:hate|c(?:++|pp)|sepples|javascript)";
+my $keyword_chance    = 1/15;
 
 # ---------- State ----------
 my $last_pasta = '';
