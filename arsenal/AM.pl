@@ -51,7 +51,7 @@ while ($request->Accept() >= 0) {
     }
 
     # 2. Keyword match
-    if ($body =~ /$activation_phrase/i && rand(1) < $keyword_chance) {
+    if ($body =~ /\b$activation_phrase\b/i && rand(1) < $keyword_chance) {
         send_response(pick_pasta());
         next;
     }
