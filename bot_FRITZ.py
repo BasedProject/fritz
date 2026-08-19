@@ -25,6 +25,7 @@ fritz.add_arm("dice.pl",       events=['chan_msg', 'priv_msg'])
 fritz.add_arm("alarm.pl",      events=['chan_msg', 'priv_msg'], poll_interval=30)
 fritz.add_arm("pick.pl",       events=['chan_msg', 'priv_msg'])
 fritz.add_arm("hibot.out",     events=['chan_msg', 'priv_msg'])
+fritz.add_arm("llm.pl",        events=['chan_msg', 'priv_msg'])
 
 fritz.Fritz(
         "chud.cyou",
