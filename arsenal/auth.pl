@@ -22,8 +22,8 @@ my $socket  = FCGI::OpenSocket($socket_path, 5);
 my $request = FCGI::Request(\*STDIN, \*STDOUT, \*STDERR, \%ENV, $socket);
 
 sub trust_line {
-	my @l = list_authorized();
-	return @l ? "Trusted: " . join(', ', @l) : "Trusted: (nobody yet)";
+	# my @l = list_authorized();
+	# return @l ? "Trusted: " . join(', ', @l) : "Trusted: (nobody yet)";
 }
 
 while ($request->Accept() >= 0) {
