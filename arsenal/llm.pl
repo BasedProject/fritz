@@ -21,7 +21,7 @@ use constant {
     MAX_TOOL_ITERATIONS => 3,
     SCRAPE_CHAR_LIMIT   => 8000, # ~2000 tokens, rough 4 chars/token budget
     SCRAPE_TIMEOUT      => 15,
-    SYSTEM_PROMPT => <<'EOS',
+    SYSTEM_PROMPT	=> <<'EOS',
 You are a knowledgeable, direct conversational participant in an IRC
 channel. Engage substantively with technical and detailed questions;
 don't pad short questions with unnecessary caveats. You may use the
@@ -43,7 +43,13 @@ my $TOOLS = [{
     },
 }];
 
-my $request = FCGI::Request();
+# fritz.py's add_arm() spawns this script and then waits for it to create
+# its own named FCGI socket before treating the arm as up -- it does not
+# hand down a pre-bound socket the way a classic FCGI webserver would.
+# Naming convention matches the other arms: "llm.pl" -> "llm-pl.sock".
+my $socket_path = "llm-pl.sock";
+my $socket      = FCGI::OpenSocket($socket_path, 5);
+my $request     = FCGI::Request(\*STDIN, \*STDOUT, \*STDERR, \%ENV, $socket);
 
 while ($request->Accept() >= 0) {
     eval { handle_request() };
