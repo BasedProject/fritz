@@ -60,14 +60,6 @@ while ($request->Accept() >= 0) {
 	my $user  = $ENV{USERNAME} // '';
 	my $chan  = $ENV{CHANNEL}  // '';
 
-	if ($event eq 'join') {
-		if ($user eq ($ENV{BOTNAME} // '')) {
-			print "$chan\n";
-			print "-- " . trust_line() . "\n";
-		}
-		next;
-	}
-
 	chomp $body if defined $body;
 	next unless defined $body && length $body;
 
