@@ -38,6 +38,7 @@ attached):
 
 import argparse
 import asyncio
+import base64
 import collections
 import logging
 import os
@@ -57,6 +58,16 @@ KICK_RE        = re.compile(rb'^:\S+\s+KICK\s+(?P<chan>\S+)\s+(?P<who>\S+)')
 QUIT_RE        = re.compile(rb'^:(?P<who>[^!]+)!\S+\s+QUIT')
 PING_RE        = re.compile(rb'^PING\s+(?P<tok>.*)$')
 OUT_REG_RE     = re.compile(rb'^(NICK|USER)\b', re.IGNORECASE)
+
+CAP_LS_RE      = re.compile(rb'^:\S+\s+CAP\s+\S+\s+LS\s+(?P<more>\*\s+)?:(?P<caps>.*)$')
+CAP_ACK_RE     = re.compile(rb'^:\S+\s+CAP\s+\S+\s+ACK\s+:?(?P<caps>.*)$')
+CAP_NAK_RE     = re.compile(rb'^:\S+\s+CAP\s+\S+\s+NAK\s+:?(?P<caps>.*)$')
+AUTH_CONT_RE   = re.compile(rb'^AUTHENTICATE\s+\+$')
+SASL_STATUS_RE = re.compile(rb'^:\S+\s+(?P<num>90[0-8])\b')
+
+
+class SASLError(Exception):
+	pass
 
 
 class LinkState:
@@ -105,11 +116,19 @@ class LinkState:
 
 
 class IRCLink:
-	def __init__(self, server, port, use_tls, control_sock_path, replay_backlog=200):
+	def __init__(self, server, port, use_tls, control_sock_path, replay_backlog=200,
+	             sasl_mechanism=None, sasl_authzid='', sasl_authcid=None,
+	             sasl_cert=None, sasl_key=None, sasl_pass_file=None):
 		self.server = server
 		self.port = port
 		self.use_tls = use_tls
 		self.control_sock_path = control_sock_path
+		self.sasl_mechanism = sasl_mechanism  # 'external' | 'plain' | None
+		self.sasl_authzid = sasl_authzid
+		self.sasl_authcid = sasl_authcid
+		self.sasl_cert = sasl_cert
+		self.sasl_key = sasl_key
+		self.sasl_pass_file = sasl_pass_file
 		self.state = LinkState()
 		self.upstream_reader = None
 		self.upstream_writer = None
@@ -120,15 +139,111 @@ class IRCLink:
 		delay = 5
 		while True:
 			try:
-				ssl_ctx = ssl.create_default_context() if self.use_tls else None
+				ssl_ctx = None
+				if self.use_tls:
+					ssl_ctx = ssl.create_default_context()
+					if self.sasl_cert:
+						ssl_ctx.load_cert_chain(self.sasl_cert, self.sasl_key)
 				self.upstream_reader, self.upstream_writer = await asyncio.open_connection(
 					self.server, self.port, ssl=ssl_ctx)
 				log.info("connected upstream to %s:%s", self.server, self.port)
+				if self.sasl_mechanism:
+					await self.do_sasl()
 				return
-			except OSError as e:
-				log.warning("upstream connect failed (%s), retrying in %ds", e, delay)
+			except (OSError, SASLError, ConnectionError) as e:
+				log.warning("upstream connect/auth failed (%s), retrying in %ds", e, delay)
+				if self.upstream_writer is not None:
+					self.upstream_writer.close()
 				await asyncio.sleep(delay)
 				delay = min(delay * 2, 300)
+
+	async def _readline_raw(self):
+		line = await self.upstream_reader.readline()
+		if not line:
+			raise ConnectionError("upstream closed during SASL")
+		return line.rstrip(b'\r\n')
+
+	async def _send_authenticate(self, payload: bytes):
+		w = self.upstream_writer
+		b64 = base64.b64encode(payload)
+		if not b64:
+			w.write(b'AUTHENTICATE +\r\n')
+			await w.drain()
+			return
+		for i in range(0, len(b64), 400):
+			w.write(b'AUTHENTICATE ' + b64[i:i + 400] + b'\r\n')
+			await w.drain()
+		if len(b64) % 400 == 0:
+			# exact multiple of the 400-byte chunk size needs an
+			# explicit empty final line to terminate the payload
+			w.write(b'AUTHENTICATE +\r\n')
+			await w.drain()
+
+	def _sasl_payload(self, mech: str) -> bytes:
+		if mech == 'EXTERNAL':
+			return self.sasl_authzid.encode()
+		if mech == 'PLAIN':
+			with open(self.sasl_pass_file) as f:
+				passwd = f.readline().rstrip('\n')
+			authcid = self.sasl_authcid or self.sasl_authzid
+			return b'\0'.join((self.sasl_authzid.encode(), authcid.encode(), passwd.encode()))
+		raise ValueError(f"unsupported SASL mechanism: {mech}")
+
+	async def do_sasl(self):
+		w = self.upstream_writer
+		w.write(b'CAP LS 302\r\n')
+		await w.drain()
+
+		caps = b''
+		while True:
+			line = await self._readline_raw()
+			m = CAP_LS_RE.match(line)
+			if not m:
+				continue
+			caps += b' ' + m.group('caps')
+			if not m.group('more'):
+				break
+
+		if b'sasl' not in caps.split():
+			log.warning("server does not advertise sasl cap, proceeding unauthenticated")
+			w.write(b'CAP END\r\n')
+			await w.drain()
+			return
+
+		w.write(b'CAP REQ :sasl\r\n')
+		await w.drain()
+		while True:
+			line = await self._readline_raw()
+			if CAP_ACK_RE.match(line):
+				break
+			if CAP_NAK_RE.match(line):
+				raise SASLError("server NAKed CAP REQ :sasl")
+
+		mech = self.sasl_mechanism.upper()
+		w.write(b'AUTHENTICATE ' + mech.encode() + b'\r\n')
+		await w.drain()
+		while True:
+			line = await self._readline_raw()
+			if AUTH_CONT_RE.match(line):
+				break
+			if SASL_STATUS_RE.match(line):
+				raise SASLError(f"SASL rejected before continuation: {line!r}")
+
+		await self._send_authenticate(self._sasl_payload(mech))
+
+		while True:
+			line = await self._readline_raw()
+			m = SASL_STATUS_RE.match(line)
+			if not m:
+				continue
+			num = m.group('num')
+			if num == b'903':
+				log.info("SASL %s authentication succeeded", mech)
+				break
+			raise SASLError(f"SASL authentication failed ({num.decode()}): {line!r}")
+
+		w.write(b'CAP END\r\n')
+		await w.drain()
 
 	async def upstream_reader_loop(self):
 		while True:
@@ -220,6 +335,17 @@ def main():
 	ap.add_argument('--no-tls', action='store_true')
 	ap.add_argument('--control-socket') # no default on purpose
 	ap.add_argument('-v', '--verbose', action='store_true')
+	ap.add_argument('--sasl-mechanism', choices=('external', 'plain'),
+	                 help="enable SASL auth during registration")
+	ap.add_argument('--sasl-authzid', default='',
+	                 help="SASL authzid (optional for both mechanisms)")
+	ap.add_argument('--sasl-authcid',
+	                 help="SASL authcid for PLAIN (defaults to --sasl-authzid)")
+	ap.add_argument('--sasl-cert', help="client cert for TLS + SASL EXTERNAL")
+	ap.add_argument('--sasl-key', help="client key for TLS + SASL EXTERNAL")
+	ap.add_argument('--sasl-pass-file',
+	                 help="file whose first line is the SASL PLAIN password "
+	                      "(kept out of argv/ps on purpose)")
 	args = ap.parse_args()
 
 	logging.basicConfig(
@@ -227,9 +353,23 @@ def main():
 		format='%(asctime)s %(name)s %(levelname)s %(message)s',
 	)
 
+	if args.sasl_mechanism == 'external':
+		if args.no_tls or not args.sasl_cert:
+			ap.error("--sasl-mechanism external requires TLS plus --sasl-cert "
+			         "(unified PEM ok, or --sasl-cert/--sasl-key split)")
+	elif args.sasl_mechanism == 'plain':
+		if not args.sasl_pass_file:
+			ap.error("--sasl-mechanism plain requires --sasl-pass-file")
+
 	os.makedirs(os.path.dirname(args.control_socket) or '.', exist_ok=True)
 
-	link = IRCLink(args.server, args.port, not args.no_tls, args.control_socket)
+	link = IRCLink(args.server, args.port, not args.no_tls, args.control_socket,
+	               sasl_mechanism=args.sasl_mechanism,
+	               sasl_authzid=args.sasl_authzid,
+	               sasl_authcid=args.sasl_authcid,
+	               sasl_cert=args.sasl_cert,
+	               sasl_key=args.sasl_key,
+	               sasl_pass_file=args.sasl_pass_file)
 
 	loop = asyncio.new_event_loop()
 	asyncio.set_event_loop(loop)
