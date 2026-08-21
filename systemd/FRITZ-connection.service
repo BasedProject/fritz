@@ -1,14 +1,15 @@
 [Unit]
-Description=irc-link: persistent IRC network connection for Fritz
+Description=FRITZ-connection: persistent IRC network connection for Fritz
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# Adjust server/port/socket path to taste. --no-tls if plaintext.
 ExecStart=/var/www/fritz/venv/bin/python3 /var/www/fritz/fritz-connection.py \
 	--server chud.cyou \
 	--port 6697 \
+	--sasl-mechanism external \
+	--sasl-cert /var/www/fritz/FRITZ.pem \
 	--control-socket /run/fritz/FRITZ.sock
 Restart=always
 RestartSec=5

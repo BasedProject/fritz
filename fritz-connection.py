@@ -204,11 +204,29 @@ class IRCLink:
 			if not m.group('more'):
 				break
 
-		if b'sasl' not in caps.split():
+		sasl_cap = None
+		for tok in caps.split():
+			if tok == b'sasl' or tok.startswith(b'sasl='):
+				sasl_cap = tok
+				break
+
+		if sasl_cap is None:
 			log.warning("server does not advertise sasl cap, proceeding unauthenticated")
 			w.write(b'CAP END\r\n')
 			await w.drain()
 			return
+
+		# CAP LS 302 lists supported mechanisms as the cap's value
+		# (e.g. b'sasl=EXTERNAL,PLAIN'); a bare b'sasl' (older/plain
+		# CAP LS) means the server didn't advertise a mechanism list,
+		# so don't gate on it -- let the server itself reject via
+		# AUTHENTICATE/904 if unsupported.
+		if b'=' in sasl_cap:
+			offered = sasl_cap.split(b'=', 1)[1].split(b',')
+			if self.sasl_mechanism.upper().encode() not in offered:
+				raise SASLError(
+					f"server offers SASL mechanisms {offered!r}, "
+					f"not {self.sasl_mechanism.upper()!r}")
 
 		w.write(b'CAP REQ :sasl\r\n')
 		await w.drain()
