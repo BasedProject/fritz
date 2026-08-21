@@ -204,6 +204,10 @@ sub llm_chat {
         max_tokens  => 1024,
     });
 
+    # Critical: Content-Length must be the number of *bytes* on the wire.
+    # JSON::PP may return a string with the UTF-8 flag set.
+    utf8::encode($payload) if utf8::is_utf8($payload);
+
     my $sock = IO::Socket::UNIX->new(
         Peer    => LLM_SOCKET,
         Type    => SOCK_STREAM,
@@ -218,41 +222,30 @@ sub llm_chat {
             . $payload;
 
     print $sock $req or die "write to llm-runtime failed: $!";
-    $sock->shutdown(1);   # done writing
+    $sock->shutdown(1);
 
-    # ------------------------------------------------------------------
-    # Read the full response (Connection: close → EOF after the body)
-    # ------------------------------------------------------------------
     local $/;
     my $raw = <$sock>;
     close $sock;
 
     die "empty response from llm-runtime" unless defined $raw && length $raw;
 
-    # Split headers / body.  Accept both \r\n\r\n and \n\n.
     my ($head, $body) = split /\r?\n\r?\n/, $raw, 2;
     $body //= '';
 
     my ($status) = $head =~ m{^HTTP/1\.[01]\s+(\d+)};
-    unless (defined $status) {
-        die "unparseable status line from llm-runtime; first 400 bytes:\n"
-          . substr($raw, 0, 400);
-    }
+    die "unparseable status line from llm-runtime; first 400 bytes:\n"
+      . substr($raw, 0, 400) unless defined $status;
 
-    # Extract framing headers (case-insensitive, first occurrence)
     my ($te) = $head =~ /^Transfer-Encoding:\s*([^\r\n]+)/mi;
     my ($cl) = $head =~ /^Content-Length:\s*(\d+)/mi;
 
     if (defined $cl) {
-        # Content-Length present → take exactly that many bytes.
-        # (Wins over Transfer-Encoding when both are present – common
-        # llama-server / cpp-httplib bug.)
         $body = substr($body, 0, $cl);
     }
     elsif (defined $te && $te =~ /\bchunked\b/i) {
         $body = dechunk($body);
     }
-    # else: no length information – keep whatever we got (Connection: close)
 
     if ($status !~ /^2/) {
         die "llm-runtime returned HTTP $status:\n"
@@ -260,22 +253,16 @@ sub llm_chat {
     }
 
     unless (length $body) {
-        # Dump diagnostics so we can see the real framing
-        my $diag = "empty body from llm-runtime despite HTTP $status\n"
-                 . "--- response head ---\n$head\n"
-                 . "--- first 300 bytes of raw response ---\n"
-                 . substr($raw, 0, 300) . "\n"
-                 . "--- length(raw)=" . length($raw)
-                 . " length(body after framing)=" . length($body) . " ---\n";
-        die $diag;
+        die "empty body from llm-runtime despite HTTP $status\n"
+          . "--- response head ---\n$head\n"
+          . "--- first 300 bytes of raw response ---\n"
+          . substr($raw, 0, 300) . "\n"
+          . "--- length(raw)=" . length($raw)
+          . " length(body after framing)=" . length($body) . " ---\n";
     }
 
     my $decoded = eval { decode_json($body) };
-    if ($@) {
-        die "bad JSON from llm-runtime (HTTP $status): $@\n"
-          . "body was (" . length($body) . " bytes):\n"
-          . substr($body, 0, 500) . "\n";
-    }
+    die "bad JSON from llm-runtime (HTTP $status): $@\nbody was:\n$body" if $@;
 
     return $decoded;
 }
