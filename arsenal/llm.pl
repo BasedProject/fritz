@@ -15,14 +15,14 @@ use IO::Socket::UNIX;
 use JSON::PP qw(encode_json decode_json);
 
 use constant {
-    LLM_SOCKET		=> '/run/llm/llm.sock',
+    LLM_SOCKET          => '/run/llm/llm.sock',
     HISTORY_DIR         => '/var/www/fritz/history',
-    HISTORY_MAX         => 100,  # stored turns (user+assistant pairs count individually)
+    HISTORY_MAX         => 100,   # stored turns (user+assistant pairs count individually)
     MAX_TOOL_ITERATIONS => 3,
-    SCRAPE_CHAR_LIMIT   => 8000, # ~2000 tokens, rough 4 chars/token budget
+    SCRAPE_CHAR_LIMIT   => 8000,  # ~2000 tokens, rough 4 chars/token budget
     SCRAPE_TIMEOUT      => 15,
-    LLM_SOCKET_TIMEOUT  => 60,   # connect+read timeout for the llama-server socket
-    SYSTEM_PROMPT	=> <<'EOS',
+    LLM_SOCKET_TIMEOUT  => 60,    # connect+read timeout for the llama-server socket
+    SYSTEM_PROMPT       => <<'EOS',
 You are a knowledgeable, direct conversational participant in an IRC
 channel. Engage substantively with technical and detailed questions;
 don't pad short questions with unnecessary caveats. You may use the
@@ -32,14 +32,16 @@ EOS
 };
 
 my $TOOLS = [{
-    type     => 'function',
+    type => 'function',
     function => {
         name        => 'scrape_url',
         description => 'Fetch a web page and return its extracted plain text content.',
         parameters  => {
             type       => 'object',
-            properties => { url => { type => 'string', description => 'The URL to fetch' } },
-            required   => ['url'],
+            properties => {
+                url => { type => 'string', description => 'The URL to fetch' },
+            },
+            required => ['url'],
         },
     },
 }];
@@ -70,7 +72,6 @@ sub handle_request {
     chomp $text;
 
     my $target = length($channel) ? $channel : $user;
-
     my $prompt = extract_prompt($text, $botname);
 
     if ($event !~ /^(?:chan_msg|priv_msg)$/ || !defined $prompt || $prompt eq '') {
@@ -83,13 +84,13 @@ sub handle_request {
     # of an IRC channel).
     my $history_key  = length($channel) ? $channel : "user:$user";
     my $history_file = history_path($history_key);
-    my $history       = load_history($history_file);
+    my $history      = load_history($history_file);
 
     push @$history, { role => 'user', content => $prompt };
 
     my $reply = converse($history);
-
     push @$history, { role => 'assistant', content => $reply };
+
     trim_history($history);
     save_history($history_file, $history);
 
@@ -141,11 +142,10 @@ sub trim_history {
 # caller appends the final assistant turn itself.
 sub converse {
     my ($history) = @_;
-
     my @messages = ({ role => 'system', content => SYSTEM_PROMPT }, @$history);
 
     for (1 .. MAX_TOOL_ITERATIONS) {
-        my $resp = llm_chat(\@messages);
+        my $resp   = llm_chat(\@messages);
         my $choice = $resp->{choices}[0]{message};
 
         if (my $calls = $choice->{tool_calls}) {
@@ -173,7 +173,7 @@ sub dispatch_tool {
     my $args = eval { decode_json($call->{function}{arguments} // '{}') } // {};
 
     return encode_json({ error => "unknown tool $name" }) unless $name eq 'scrape_url';
-    return encode_json({ error => 'missing url' }) unless $args->{url};
+    return encode_json({ error => 'missing url' })       unless $args->{url};
 
     return scrape_url($args->{url});
 }
@@ -184,6 +184,7 @@ sub scrape_url {
 
     my $safe_url = $url;
     $safe_url =~ s/'/'\\''/g;
+
     my $text = qx{timeout ${\SCRAPE_TIMEOUT} w3m -dump -cols 100 '$safe_url' 2>/dev/null};
     return "failed to fetch $url" unless defined $text && length $text;
 
@@ -217,7 +218,7 @@ sub llm_chat {
             . $payload;
 
     print $sock $req;
-    $sock->shutdown(1); # done writing
+    $sock->shutdown(1);   # done writing
 
     local $/;
     my $raw = <$sock>;
@@ -233,30 +234,55 @@ sub llm_chat {
     die "unparseable status line from llm-runtime; got:\n$head"
         unless defined $status;
 
-    $body = dechunk($body) if $head =~ /^Transfer-Encoding:\s*chunked/mi;
+    # Prefer Content-Length when both CL and TE:chunked are present
+    # (llama-server / cpp-httplib has been observed to emit both with a
+    # non-chunked body). Only run the chunk decoder when there is no CL.
+    my ($te) = $head =~ /^Transfer-Encoding:\s*([^\r\n]+)/mi;
+    my ($cl) = $head =~ /^Content-Length:\s*(\d+)/mi;
+
+    if (defined $cl) {
+        $body = substr($body // '', 0, $cl);
+    }
+    elsif (defined $te && $te =~ /\bchunked\b/i) {
+        $body = dechunk($body // '');
+    }
 
     if ($status !~ /^2/) {
         die "llm-runtime returned HTTP $status:\n"
-          . (length($body) ? $body : "(empty body)");
+          . (length($body // '') ? $body : "(empty body)");
     }
 
-    die "empty body from llm-runtime despite HTTP $status" unless length $body;
+    die "empty body from llm-runtime despite HTTP $status"
+        unless defined $body && length $body;
 
     my $decoded = eval { decode_json($body) };
     die "bad JSON from llm-runtime (HTTP $status): $@\nbody was:\n$body" if $@;
+
     return $decoded;
 }
 
 sub dechunk {
     my ($data) = @_;
+    return $data unless defined $data && length $data;
+
+    # Real chunked bodies start with a hex size. If this doesn't look
+    # like chunked data, return the original (handles dual-header bugs).
+    return $data unless $data =~ /\A[0-9A-Fa-f]+(?:;[^\r\n]*)?\r\n/;
+
     my $out = '';
-    # tolerate chunk-extensions ("<size>;ext=val\r\n") even though
-    # llama-server's httplib backend doesn't currently emit them
+    pos($data) = 0;
+
     while ($data =~ /\G([0-9A-Fa-f]+)(?:;[^\r\n]*)?\r\n/gc) {
         my $len = hex($1);
         last if $len == 0;
+
+        # Not enough data left → treat as non-chunked / malformed
+        return $data if pos($data) + $len + 2 > length($data);
+
         $out .= substr($data, pos($data), $len);
-        pos($data) += $len + 2;
+        pos($data) += $len + 2;   # data + trailing CRLF
     }
-    return $out;
+
+    # Never return empty on parse failure
+    return length($out) ? $out : $data;
 }
