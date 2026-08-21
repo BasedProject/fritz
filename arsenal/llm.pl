@@ -192,8 +192,6 @@ sub scrape_url {
     return $text;
 }
 
-# POST a chat-completion request to llama-server over the AF_UNIX socket
-# and return the decoded JSON response.
 sub llm_chat {
     my ($messages) = @_;
 
@@ -204,65 +202,37 @@ sub llm_chat {
         max_tokens  => 1024,
     });
 
-    # Critical: Content-Length must be the number of *bytes* on the wire.
-    # JSON::PP may return a string with the UTF-8 flag set.
+    # Force bytes so nothing funny happens with UTF-8 flags
     utf8::encode($payload) if utf8::is_utf8($payload);
 
-    my $sock = IO::Socket::UNIX->new(
-        Peer    => LLM_SOCKET,
-        Type    => SOCK_STREAM,
-        Timeout => LLM_SOCKET_TIMEOUT,
-    ) or die "connect to ${\LLM_SOCKET} failed: $!";
+    # Write payload to a temp file so we don't have to worry about
+    # shell escaping of the JSON.
+    require File::Temp;
+    my ($fh, $tmp) = File::Temp::tempfile(UNLINK => 1);
+    binmode($fh);
+    print $fh $payload;
+    close $fh;
 
-    my $req = "POST /v1/chat/completions HTTP/1.1\r\n"
-            . "Host: localhost\r\n"
-            . "Content-Type: application/json\r\n"
-            . "Content-Length: " . length($payload) . "\r\n"
-            . "Connection: close\r\n\r\n"
-            . $payload;
+    my $cmd = join(' ',
+        'curl',
+        '--silent',
+        '--show-error',
+        '--max-time', LLM_SOCKET_TIMEOUT,
+        '--unix-socket', quotemeta(LLM_SOCKET),
+        '-H', '"Content-Type: application/json"',
+        '-d', '@' . $tmp,
+        'http://localhost/v1/chat/completions',
+    );
 
-    print $sock $req or die "write to llm-runtime failed: $!";
-    $sock->shutdown(1);
+    my $body = qx{$cmd 2>&1};
+    my $exit = $? >> 8;
 
-    local $/;
-    my $raw = <$sock>;
-    close $sock;
-
-    die "empty response from llm-runtime" unless defined $raw && length $raw;
-
-    my ($head, $body) = split /\r?\n\r?\n/, $raw, 2;
-    $body //= '';
-
-    my ($status) = $head =~ m{^HTTP/1\.[01]\s+(\d+)};
-    die "unparseable status line from llm-runtime; first 400 bytes:\n"
-      . substr($raw, 0, 400) unless defined $status;
-
-    my ($te) = $head =~ /^Transfer-Encoding:\s*([^\r\n]+)/mi;
-    my ($cl) = $head =~ /^Content-Length:\s*(\d+)/mi;
-
-    if (defined $cl) {
-        $body = substr($body, 0, $cl);
-    }
-    elsif (defined $te && $te =~ /\bchunked\b/i) {
-        $body = dechunk($body);
-    }
-
-    if ($status !~ /^2/) {
-        die "llm-runtime returned HTTP $status:\n"
-          . (length($body) ? $body : "(empty body)\n--- head ---\n$head");
-    }
-
-    unless (length $body) {
-        die "empty body from llm-runtime despite HTTP $status\n"
-          . "--- response head ---\n$head\n"
-          . "--- first 300 bytes of raw response ---\n"
-          . substr($raw, 0, 300) . "\n"
-          . "--- length(raw)=" . length($raw)
-          . " length(body after framing)=" . length($body) . " ---\n";
+    if ($exit != 0 || !defined $body || $body eq '') {
+        die "curl to llm-runtime failed (exit $exit):\n$body";
     }
 
     my $decoded = eval { decode_json($body) };
-    die "bad JSON from llm-runtime (HTTP $status): $@\nbody was:\n$body" if $@;
+    die "bad JSON from llm-runtime: $@\nbody was:\n$body" if $@;
 
     return $decoded;
 }
