@@ -217,46 +217,65 @@ sub llm_chat {
             . "Connection: close\r\n\r\n"
             . $payload;
 
-    print $sock $req;
+    print $sock $req or die "write to llm-runtime failed: $!";
     $sock->shutdown(1);   # done writing
 
+    # ------------------------------------------------------------------
+    # Read the full response (Connection: close → EOF after the body)
+    # ------------------------------------------------------------------
     local $/;
     my $raw = <$sock>;
     close $sock;
 
     die "empty response from llm-runtime" unless defined $raw && length $raw;
 
-    my ($head, $body) = split /\r\n\r\n/, $raw, 2;
-    die "no header/body separator in llm-runtime response; got:\n$raw"
-        unless defined $body;
+    # Split headers / body.  Accept both \r\n\r\n and \n\n.
+    my ($head, $body) = split /\r?\n\r?\n/, $raw, 2;
+    $body //= '';
 
     my ($status) = $head =~ m{^HTTP/1\.[01]\s+(\d+)};
-    die "unparseable status line from llm-runtime; got:\n$head"
-        unless defined $status;
+    unless (defined $status) {
+        die "unparseable status line from llm-runtime; first 400 bytes:\n"
+          . substr($raw, 0, 400);
+    }
 
-    # Prefer Content-Length when both CL and TE:chunked are present
-    # (llama-server / cpp-httplib has been observed to emit both with a
-    # non-chunked body). Only run the chunk decoder when there is no CL.
+    # Extract framing headers (case-insensitive, first occurrence)
     my ($te) = $head =~ /^Transfer-Encoding:\s*([^\r\n]+)/mi;
     my ($cl) = $head =~ /^Content-Length:\s*(\d+)/mi;
 
     if (defined $cl) {
-        $body = substr($body // '', 0, $cl);
+        # Content-Length present → take exactly that many bytes.
+        # (Wins over Transfer-Encoding when both are present – common
+        # llama-server / cpp-httplib bug.)
+        $body = substr($body, 0, $cl);
     }
     elsif (defined $te && $te =~ /\bchunked\b/i) {
-        $body = dechunk($body // '');
+        $body = dechunk($body);
     }
+    # else: no length information – keep whatever we got (Connection: close)
 
     if ($status !~ /^2/) {
         die "llm-runtime returned HTTP $status:\n"
-          . (length($body // '') ? $body : "(empty body)");
+          . (length($body) ? $body : "(empty body)\n--- head ---\n$head");
     }
 
-    die "empty body from llm-runtime despite HTTP $status"
-        unless defined $body && length $body;
+    unless (length $body) {
+        # Dump diagnostics so we can see the real framing
+        my $diag = "empty body from llm-runtime despite HTTP $status\n"
+                 . "--- response head ---\n$head\n"
+                 . "--- first 300 bytes of raw response ---\n"
+                 . substr($raw, 0, 300) . "\n"
+                 . "--- length(raw)=" . length($raw)
+                 . " length(body after framing)=" . length($body) . " ---\n";
+        die $diag;
+    }
 
     my $decoded = eval { decode_json($body) };
-    die "bad JSON from llm-runtime (HTTP $status): $@\nbody was:\n$body" if $@;
+    if ($@) {
+        die "bad JSON from llm-runtime (HTTP $status): $@\n"
+          . "body was (" . length($body) . " bytes):\n"
+          . substr($body, 0, 500) . "\n";
+    }
 
     return $decoded;
 }
@@ -265,24 +284,27 @@ sub dechunk {
     my ($data) = @_;
     return $data unless defined $data && length $data;
 
-    # Real chunked bodies start with a hex size. If this doesn't look
-    # like chunked data, return the original (handles dual-header bugs).
-    return $data unless $data =~ /\A[0-9A-Fa-f]+(?:;[^\r\n]*)?\r\n/;
+    # Quick reject: real chunked bodies start with a hex size
+    return $data unless $data =~ /\A[0-9A-Fa-f]+(?:;[^\r\n]*)?\r?\n/;
 
     my $out = '';
     pos($data) = 0;
 
-    while ($data =~ /\G([0-9A-Fa-f]+)(?:;[^\r\n]*)?\r\n/gc) {
+    while ($data =~ /\G([0-9A-Fa-f]+)(?:;[^\r\n]*)?\r?\n/gc) {
         my $len = hex($1);
         last if $len == 0;
 
         # Not enough data left → treat as non-chunked / malformed
-        return $data if pos($data) + $len + 2 > length($data);
+        return $data if pos($data) + $len > length($data);
 
         $out .= substr($data, pos($data), $len);
-        pos($data) += $len + 2;   # data + trailing CRLF
+        pos($data) += $len;
+
+        # Optional trailing CRLF after the chunk data
+        if ($data =~ /\G\r?\n/gc) {
+            # consumed
+        }
     }
 
-    # Never return empty on parse failure
     return length($out) ? $out : $data;
 }
