@@ -21,6 +21,7 @@ use constant {
     MAX_TOOL_ITERATIONS => 3,
     SCRAPE_CHAR_LIMIT   => 8000, # ~2000 tokens, rough 4 chars/token budget
     SCRAPE_TIMEOUT      => 15,
+    LLM_SOCKET_TIMEOUT  => 60,   # connect+read timeout for the llama-server socket
     SYSTEM_PROMPT	=> <<'EOS',
 You are a knowledgeable, direct conversational participant in an IRC
 channel. Engage substantively with technical and detailed questions;
@@ -203,8 +204,9 @@ sub llm_chat {
     });
 
     my $sock = IO::Socket::UNIX->new(
-        Peer => LLM_SOCKET,
-        Type => SOCK_STREAM,
+        Peer    => LLM_SOCKET,
+        Type    => SOCK_STREAM,
+        Timeout => LLM_SOCKET_TIMEOUT,
     ) or die "connect to ${\LLM_SOCKET} failed: $!";
 
     my $req = "POST /v1/chat/completions HTTP/1.1\r\n"
@@ -224,17 +226,33 @@ sub llm_chat {
     die "empty response from llm-runtime" unless defined $raw && length $raw;
 
     my ($head, $body) = split /\r\n\r\n/, $raw, 2;
+    die "no header/body separator in llm-runtime response; got:\n$raw"
+        unless defined $body;
+
+    my ($status) = $head =~ m{^HTTP/1\.[01]\s+(\d+)};
+    die "unparseable status line from llm-runtime; got:\n$head"
+        unless defined $status;
+
     $body = dechunk($body) if $head =~ /^Transfer-Encoding:\s*chunked/mi;
 
+    if ($status !~ /^2/) {
+        die "llm-runtime returned HTTP $status:\n"
+          . (length($body) ? $body : "(empty body)");
+    }
+
+    die "empty body from llm-runtime despite HTTP $status" unless length $body;
+
     my $decoded = eval { decode_json($body) };
-    die "bad JSON from llm-runtime: $@" if $@;
+    die "bad JSON from llm-runtime (HTTP $status): $@\nbody was:\n$body" if $@;
     return $decoded;
 }
 
 sub dechunk {
     my ($data) = @_;
     my $out = '';
-    while ($data =~ /\G([0-9A-Fa-f]+)\r\n/gc) {
+    # tolerate chunk-extensions ("<size>;ext=val\r\n") even though
+    # llama-server's httplib backend doesn't currently emit them
+    while ($data =~ /\G([0-9A-Fa-f]+)(?:;[^\r\n]*)?\r\n/gc) {
         my $len = hex($1);
         last if $len == 0;
         $out .= substr($data, pos($data), $len);
