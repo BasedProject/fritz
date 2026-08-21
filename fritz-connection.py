@@ -258,6 +258,11 @@ class IRCLink:
 			if num == b'903':
 				log.info("SASL %s authentication succeeded", mech)
 				break
+			if num in (b'900', b'901'):
+				# informational (RPL_LOGGEDIN / RPL_LOGGEDOUT) -- keep
+				# waiting for the actual 903 success numeric
+				log.debug("SASL status %s: %r", num.decode(), line)
+				continue
 			raise SASLError(f"SASL authentication failed ({num.decode()}): {line!r}")
 
 		w.write(b'CAP END\r\n')
